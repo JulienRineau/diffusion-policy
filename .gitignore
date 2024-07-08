@@ -54,6 +54,8 @@ cover/
 wandb/
 mnist/
 
+*.ipynb
+
 # Translations
 *.mo
 *.pot
