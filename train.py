@@ -26,6 +26,9 @@ class UNETLightning(pl.LightningModule):
         self.net = UNET(config)
         self.loss_fn = nn.MSELoss()
 
+    def forward(self, x):
+        return self.net(x)
+
     def training_step(self, batch, batch_idx):
         x, _ = batch
         noise_amount = torch.rand(x.shape[0], device=self.device)
@@ -57,7 +60,11 @@ if __name__ == "__main__":
     model = UNETLightning(config)
 
     trainer = pl.Trainer(
-        max_epochs=3, logger=wandb_logger, log_every_n_steps=10, accelerator="mps"
+        max_epochs=3,
+        logger=wandb_logger,
+        log_every_n_steps=10,
+        accelerator="auto",
+        devices="auto",
     )
 
     trainer.fit(model, train_dataloader)
