@@ -25,23 +25,39 @@ class UNETLightning(pl.LightningModule):
         self.save_hyperparameters()
         self.net = UNET(config)
         self.loss_fn = nn.MSELoss()
+        self.num_train_timesteps = 1000
+        self.noise_scheduler = DDPMScheduler(
+            num_train_timesteps=self.num_train_timesteps,
+            beta_schedule="squaredcos_cap_v2",
+        )
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x, t, class_labels):
+        return self.net(x, t, class_labels)
 
     def training_step(self, batch, batch_idx):
-        x, _ = batch
-        noise_amount = torch.rand(x.shape[0], device=self.device)
-        noisy_x = corrupt(x, noise_amount)
-        pred = self.net(noisy_x)
-        loss = self.loss_fn(pred, x)
+        x, class_labels = batch
+
+        # Sample noise to add to the images
+        noise = torch.randn_like(x)
+
+        # Sample a random timestep for each image
+        timesteps = torch.randint(
+            0, self.num_train_timesteps, (x.shape[0],), device=self.device
+        ).long()
+
+        # Add noise to the input images according to the noise magnitude at each timestep
+        noisy_images = self.noise_scheduler.add_noise(x, noise, timesteps)
+
+        noise_pred = self.net(noisy_images, timesteps, class_labels)
+        loss = F.mse_loss(noise_pred, noise)
+
         self.log(
             "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
         )
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=1e-3)
+        return torch.optim.Adam(self.parameters(), lr=1e-4)
 
 
 if __name__ == "__main__":
@@ -60,7 +76,7 @@ if __name__ == "__main__":
     model = UNETLightning(config)
 
     trainer = pl.Trainer(
-        max_epochs=3,
+        max_epochs=6,
         logger=wandb_logger,
         log_every_n_steps=10,
         accelerator="auto",
