@@ -338,10 +338,10 @@ class DiT(nn.Module):
 if __name__ == "__main__":
     # Set up the configuration
     config = DiTConfig(
-        image_size=32,
+        image_size=28,
         patch_size=4,
-        in_channels=4,
-        out_channels=4,
+        in_channels=1,
+        out_channels=1,
         n_layer=3,
         n_head=4,
         n_embd=128,
@@ -352,7 +352,7 @@ if __name__ == "__main__":
     model = DiT(config)
 
     # Create sample inputs
-    batch_size = 2
+    batch_size = 8
     x = torch.randn(
         batch_size, config.in_channels, config.image_size, config.image_size
     ).float()
