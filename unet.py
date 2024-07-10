@@ -1,9 +1,9 @@
+import math
 from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
 import torchvision.transforms.functional as TF
-import math
 
 
 @dataclass
@@ -43,7 +43,7 @@ class ResNetBlock(nn.Module):
         self, in_channels, out_channels, time_emb_dim, class_emb_dim, dropout_rate=0.5
     ):
         super(ResNetBlock, self).__init__()
-        self.time_mlp = nn.Linear(time_emb_dim + class_emb_dim, out_channels)
+        self.time_class_mlp = nn.Linear(time_emb_dim + class_emb_dim, out_channels)
 
         self.bn0 = nn.BatchNorm2d(in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False)
@@ -60,7 +60,7 @@ class ResNetBlock(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x, t):
+    def forward(self, x, t_c):
         identity = self.downsample(x)
 
         out = self.bn0(x)
@@ -69,7 +69,7 @@ class ResNetBlock(nn.Module):
         out = self.gelu(out)
 
         # Time and class embedding injection
-        time_emb = self.time_mlp(t)
+        time_emb = self.time_class_mlp(t_c)
         time_emb = time_emb.view(time_emb.shape[0], -1, 1, 1)  # Reshape to [B, C, 1, 1]
         out = out + time_emb
 

@@ -1,8 +1,10 @@
 import os
-import torch
+
 import matplotlib.pyplot as plt
-from train import UNETLightning
 import numpy as np
+import torch
+
+from train import UNETLightning
 
 
 def sample_ddpm(
