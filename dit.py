@@ -392,7 +392,7 @@ if __name__ == "__main__":
     config = DiTConfig()
 
     # Instantiate the model
-    model = DiT(config)
+    model = DiT(config, skip_init=True)
 
     # Create sample inputs
     batch_size = 8
