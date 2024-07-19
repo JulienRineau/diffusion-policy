@@ -1,96 +1,65 @@
+import math
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 from torch.nn import functional as F
 
 
 @dataclass
 class DiTConfig:
     image_size: int = 32  # Size of the input image
-    patch_size: int = 4  # Size of each patch
+    patch_size: int = 2  # Size of each patch
     in_channels: int = 4
     out_channels: int = 4  # Usually same as in_channels
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768  # Hidden dimension size
-    num_classes: int = 10
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512  # Hidden dimension size
+    num_classes: int = 5
 
     def __post_init__(self):
         self.block_size = (self.image_size // self.patch_size) ** 2
 
 
-class MLP(nn.Module):
-    """
-    Attributes:
-        fc (nn.Linear): The first fully connected layer.
-        gelu (nn.GELU): Gaussian Error Linear Unit activation layer.
-        proj (nn.Linear): The second fully connected layer projecting back to embedding dimension.
-    """
-
+class MLPWithDepthwiseConv(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
+        # Add depthwise convolution
+        self.depthwise_conv = nn.Conv2d(
+            4 * config.n_embd,
+            4 * config.n_embd,
+            kernel_size=4,
+            padding="same",
+            groups=4 * config.n_embd,
+        )
+
     def forward(self, x):
+        b, t, c = x.shape
+
         x = self.c_fc(x)
         x = self.gelu(x)
+
+        # Reshape for depthwise convolution
+        h = w = int(math.sqrt(t))
+        x = x.transpose(1, 2).view(b, 4 * c, h, w).contiguous()
+
+        # Apply depthwise convolution
+        x = self.depthwise_conv(x)
+
+        # Reshape back
+        x = x.view(b, 4 * c, t).transpose(1, 2).contiguous()
+
         x = self.c_proj(x)
         return x
 
 
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
-class DiTBlock(nn.Module):
-    """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    """
-
-    def __init__(self, config: DiTConfig):
-        super().__init__()
-        self.n_embd = config.n_embd
-        self.n_head = config.n_head
-
-        # Layer norms
-        self.norm1 = nn.LayerNorm(config.n_embd, elementwise_affine=False, eps=1e-6)
-        self.norm2 = nn.LayerNorm(config.n_embd, elementwise_affine=False, eps=1e-6)
-
-        # Self-attention
-        self.attn = SelfAttention(config)
-
-        # MLP
-        self.mlp = MLP(config)
-
-        # AdaLN-Zero modulation
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(config.n_embd, 6 * config.n_embd, bias=True)
-        )
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = self.adaLN_modulation(c).chunk(6, dim=1)
-
-        # Self-attention
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa)
-        )
-
-        # MLP
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(self.norm2(x), shift_mlp, scale_mlp)
-        )
-
-        return x
+    return x * (1 + scale) + shift
 
 
 class SelfAttention(nn.Module):
@@ -138,9 +107,76 @@ class SelfAttention(nn.Module):
         return y
 
 
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+
+        # Handle odd dimensions
+        if self.dim % 2 == 1:
+            embeddings = torch.cat(
+                [embeddings, torch.zeros_like(embeddings[:, :1])], dim=-1
+            )
+
+        return embeddings
+
+
+class DiTBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    """
+
+    def __init__(self, config: DiTConfig):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_head = config.n_head
+
+        # Layer norms
+        self.norm1 = nn.LayerNorm(config.n_embd, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(config.n_embd, elementwise_affine=False, eps=1e-6)
+
+        # Self-attention
+        self.attn = SelfAttention(config)
+
+        # MLP
+        self.mlp = MLPWithDepthwiseConv(config)
+
+        # AdaLN-Zero modulation
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(config.n_embd, 6 * config.n_embd, bias=True)
+        )
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        modulation = self.adaLN_modulation(c)  # Shape: (B, T, 6*C)
+        modulation = modulation[:, -1, :]  # Take the last token, shape: (B, 6*C)
+        modulation = modulation.view(B, 6, C)  # Reshape to (B, 6, C)
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            modulation.chunk(6, dim=1)
+        )
+
+        # Self-attention
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+
+        # MLP
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+
+        return x
+
+
 class Patchify(nn.Module):
     def __init__(self, config: DiTConfig):
         super().__init__()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.config = config
         self.patch_size = config.patch_size
         self.projection = nn.Linear(
@@ -195,17 +231,28 @@ class FirstLayer(nn.Module):
         self.patchify = Patchify(config)
 
         # Positional embedding
-        self.pos_embed = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
+        self.pos_embed = nn.Parameter(
+            self._get_sinusoidal_embeddings(config.block_size, config.n_embd)
+        )
 
         # Timestep embedding
         self.t_embedder = nn.Sequential(
-            nn.Linear(1, config.n_embd),
-            nn.SiLU(),
+            SinusoidalPositionEmbeddings(config.n_embd),
+            nn.Linear(config.n_embd, config.n_embd),
+            nn.GELU(approximate="tanh"),
             nn.Linear(config.n_embd, config.n_embd),
         )
 
         # Class embedding
         self.y_embedder = nn.Embedding(config.num_classes, config.n_embd)
+
+    def _get_sinusoidal_embeddings(self, n_position, d_hid):
+        position = torch.arange(n_position).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_hid, 2) * -(math.log(10000.0) / d_hid))
+        pos_embedding = torch.zeros(1, n_position, d_hid)
+        pos_embedding[0, :, 0::2] = torch.sin(position * div_term)
+        pos_embedding[0, :, 1::2] = torch.cos(position * div_term)
+        return pos_embedding
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> tuple:
         """
@@ -249,7 +296,12 @@ class FinalLayer(nn.Module):
         )
 
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        B, T, C = x.shape
+        modulation = self.adaLN_modulation(c)  # Shape: (B, T, 6*C)
+        modulation = modulation[:, -1, :]  # Take the last token, shape: (B, 6*C)
+        modulation = modulation.view(B, 2, C)  # Reshape to (B, 6, C)
+
+        shift, scale = modulation.chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
@@ -275,17 +327,29 @@ class DiT(nn.Module):
 
     """
 
-    def __init__(self, config: DiTConfig):
+    def __init__(self, config: DiTConfig, skip_init=False):
         super().__init__()
         self.config = config
 
-        self.patchify = Patchify(config)
-        self.pos_embedding = nn.Parameter(
-            torch.zeros(1, config.block_size, config.n_embd)
-        )
         self.first_layer = FirstLayer(config)
         self.blocks = nn.ModuleList([DiTBlock(config) for _ in range(config.n_layer)])
         self.final_layer = FinalLayer(config)
+
+        if not skip_init:
+            self.__init_weights()
+
+    def __init_weights(self):
+        # Initialize final layer weights to zero
+        init.zeros_(self.final_layer.linear.weight)
+        init.zeros_(self.final_layer.linear.bias)
+
+        # Initialize adaLN weights to zero
+        init.zeros_(self.final_layer.adaLN_modulation[-1].weight)
+        init.zeros_(self.final_layer.adaLN_modulation[-1].bias)
+
+        for block in self.blocks:
+            init.zeros_(block.adaLN_modulation[-1].weight)
+            init.zeros_(block.adaLN_modulation[-1].bias)
 
     def forward(
         self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor
@@ -300,18 +364,6 @@ class DiT(nn.Module):
 
         Returns:
             torch.Tensor: Output image tensor of shape (batch_size, out_channels, image_size, image_size).
-
-        Raises:
-            ValueError: If input tensor shapes are inconsistent with the model configuration.
-
-        Note:
-            This method processes the input through the following steps:
-            1. Patchify and embed the input image.
-            2. Add positional embeddings.
-            3. Process through DiT blocks.
-            4. Apply the final layer.
-            5. Reshape the output back to image format.
-
         """
         x, c = self.first_layer(x, t, y)
         for block in self.blocks:
@@ -337,16 +389,7 @@ class DiT(nn.Module):
 
 if __name__ == "__main__":
     # Set up the configuration
-    config = DiTConfig(
-        image_size=28,
-        patch_size=4,
-        in_channels=1,
-        out_channels=1,
-        n_layer=3,
-        n_head=4,
-        n_embd=128,
-        num_classes=10,
-    )
+    config = DiTConfig()
 
     # Instantiate the model
     model = DiT(config)
@@ -360,37 +403,33 @@ if __name__ == "__main__":
     y = torch.randint(0, config.num_classes, (batch_size,)).float()
 
     # Forward pass
-    try:
-        output = model(x, t, y)
-        print("Forward pass successful!")
-        print(f"Input shape: {x.shape}")
-        print(f"Output shape: {output.shape}")
-        print(f"Number of patches (block size): {config.block_size}")
+    output = model(x, t, y)
+    print("Forward pass successful!")
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {output.shape}")
+    print(f"Number of patches (block size): {config.block_size}")
 
-        # Check output shape
-        expected_shape = (
-            batch_size,
-            config.out_channels,
-            config.image_size,
-            config.image_size,
-        )
-        assert (
-            output.shape == expected_shape
-        ), f"Output shape {output.shape} doesn't match expected shape {expected_shape}"
-        print("Output shape is correct.")
+    # Check output shape
+    expected_shape = (
+        batch_size,
+        config.out_channels,
+        config.image_size,
+        config.image_size,
+    )
+    assert (
+        output.shape == expected_shape
+    ), f"Output shape {output.shape} doesn't match expected shape {expected_shape}"
+    print("Output shape is correct.")
 
-        # Check if output values are within a reasonable range
-        assert torch.isfinite(output).all(), "Output contains NaN or infinite values"
-        print("Output values are finite.")
+    # Check if output values are within a reasonable range
+    assert torch.isfinite(output).all(), "Output contains NaN or infinite values"
+    print("Output values are finite.")
 
-        # Check if the model is responsive to different inputs
-        output2 = model(x, t + 1, y)
-        assert not torch.allclose(
-            output, output2
-        ), "Model output doesn't change with different timesteps"
-        print("Model is responsive to different timesteps.")
+    # Check if the model is responsive to different inputs
+    output2 = model(x, t + 1, y)
+    assert not torch.allclose(
+        output, output2
+    ), "Model output doesn't change with different timesteps"
+    print("Model is responsive to different timesteps.")
 
-        print("All tests passed successfully!")
-
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
+    print("All tests passed successfully!")
