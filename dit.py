@@ -9,102 +9,14 @@ from torch.nn import functional as F
 
 @dataclass
 class DiTConfig:
-    image_size: int = 32  # Size of the input image
-    patch_size: int = 2  # Size of each patch
-    in_channels: int = 4
-    out_channels: int = 4  # Usually same as in_channels
+    obs_dim: int = 3  # Dimension of observation (excluding agent position)
+    action_dim: int = 4  # Dimension of action
     n_layer: int = 8
     n_head: int = 8
     n_embd: int = 512  # Hidden dimension size
-    num_classes: int = 5
-
-    def __post_init__(self):
-        self.block_size = (self.image_size // self.patch_size) ** 2
-
-
-class MLPWithDepthwiseConv(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu = nn.GELU(approximate="tanh")
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-
-        # Add depthwise convolution
-        self.depthwise_conv = nn.Conv2d(
-            4 * config.n_embd,
-            4 * config.n_embd,
-            kernel_size=4,
-            padding="same",
-            groups=4 * config.n_embd,
-        )
-
-    def forward(self, x):
-        b, t, c = x.shape
-
-        x = self.c_fc(x)
-        x = self.gelu(x)
-
-        # Reshape for depthwise convolution
-        h = w = int(math.sqrt(t))
-        x = x.transpose(1, 2).view(b, 4 * c, h, w).contiguous()
-
-        # Apply depthwise convolution
-        x = self.depthwise_conv(x)
-
-        # Reshape back
-        x = x.view(b, 4 * c, t).transpose(1, 2).contiguous()
-
-        x = self.c_proj(x)
-        return x
-
-
-def modulate(x, shift, scale):
-    return x * (1 + scale) + shift
-
-
-class SelfAttention(nn.Module):
-    """Causal multihead self-attention implementation.
-
-    Attributes:
-        c_attn (nn.Linear): Linear layer to create queries, keys, and values.
-        c_proj (nn.Linear): Linear layer to project the output of attention back to the embedding dimension.
-    """
-
-    def __init__(self, config: DiTConfig):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(
-            config.n_embd, 3 * config.n_embd
-        )  # projects embedding to bigger space to extract Q, K, V
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.size()  # batch, seq length, embedding depth
-
-        qkv = self.c_attn(x)
-        # Split the combined qkv matrix and reshape it to get individual q, k, v matrices
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        # q, k, v shapes: each (B, T, C)
-
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        # q, k, v shapes after reshape and transpose: each (B, n_head, T, C // n_head)
-
-        y = F.scaled_dot_product_attention(q, k, v)
-        # y shape: (B, n_head, T, C // n_head)
-
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        # y shape after transpose and reshape: (B, T, C)
-
-        y = self.c_proj(y)
-        # y shape after projection: (B, T, C)
-
-        return y
+    obs_horizon: int = 2  # Number of observation steps
+    pred_horizon: int = 10  # Number of prediction steps
+    agent_pos_dim: int = 2  # Dimension of agent position
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -119,120 +31,31 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-
-        # Handle odd dimensions
-        if self.dim % 2 == 1:
-            embeddings = torch.cat(
-                [embeddings, torch.zeros_like(embeddings[:, :1])], dim=-1
-            )
-
         return embeddings
 
 
-class DiTBlock(nn.Module):
-    """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    """
-
-    def __init__(self, config: DiTConfig):
-        super().__init__()
-        self.n_embd = config.n_embd
-        self.n_head = config.n_head
-
-        # Layer norms
-        self.norm1 = nn.LayerNorm(config.n_embd, elementwise_affine=False, eps=1e-6)
-        self.norm2 = nn.LayerNorm(config.n_embd, elementwise_affine=False, eps=1e-6)
-
-        # Self-attention
-        self.attn = SelfAttention(config)
-
-        # MLP
-        self.mlp = MLPWithDepthwiseConv(config)
-
-        # AdaLN-Zero modulation
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(config.n_embd, 6 * config.n_embd, bias=True)
-        )
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.shape
-        modulation = self.adaLN_modulation(c)  # Shape: (B, T, 6*C)
-        modulation = modulation[:, -1, :]  # Take the last token, shape: (B, 6*C)
-        modulation = modulation.view(B, 6, C)  # Reshape to (B, 6, C)
-
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            modulation.chunk(6, dim=1)
-        )
-
-        # Self-attention
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-
-        # MLP
-        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-
-        return x
-
-
-class Patchify(nn.Module):
-    def __init__(self, config: DiTConfig):
-        super().__init__()
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.config = config
-        self.patch_size = config.patch_size
-        self.projection = nn.Linear(
-            config.patch_size * config.patch_size * config.in_channels, config.n_embd
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        p = self.patch_size
-        assert (
-            h == w == self.config.image_size
-        ), f"Input image size ({h}x{w}) doesn't match the expected size ({self.config.image_size}x{self.config.image_size})"
-        assert (
-            h % p == 0 and w % p == 0
-        ), f"Image dimensions must be divisible by the patch size {p}"
-
-        # Reshape and permute to get patches
-        x = x.reshape(b, c, h // p, p, w // p, p)
-        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
-        x = x.view(b, -1, p * p * c)
-
-        # Project patches to embedding dimension
-        x = self.projection(x)
-
-        return x
-
-    @property
-    def num_patches(self):
-        """Calculate the number of patches based on the input shape and patch size."""
-        h, w = 256, 256  # Assuming 256x256 images as mentioned in the text
-        return (h // self.patch_size) * (w // self.patch_size)
-
-
 class FirstLayer(nn.Module):
-    """
-    Process the input through the first layer of the model.
-
-    Args:
-        x (torch.Tensor): Input image tensor.
-        t (torch.Tensor): Timestep tensor.
-        y (torch.Tensor): Class labels tensor.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Processed image tensor and conditioning tensor.
-    """
-
     def __init__(self, config: DiTConfig):
         super().__init__()
         self.config = config
 
-        # Patchify
-        self.patchify = Patchify(config)
+        # Action embedding
+        self.act_embedding = nn.Linear(config.action_dim, config.n_embd)
+        # Action positional embedding
+        self.x_pos_embed = nn.Parameter(
+            self._get_sinusoidal_embeddings(config.pred_horizon, config.n_embd)
+        )
 
-        # Positional embedding
-        self.pos_embed = nn.Parameter(
-            self._get_sinusoidal_embeddings(config.block_size, config.n_embd)
+        # Observation embedding
+        self.obs_embedding = nn.Linear(
+            config.obs_dim + config.agent_pos_dim, config.n_embd
+        )
+        # Observation positional embedding
+        self.obs_pos_embed = nn.Parameter(
+            self._get_sinusoidal_embeddings(config.obs_horizon, config.n_embd)
+        )
+        self.obs_projection = nn.Linear(
+            config.obs_horizon * config.n_embd, config.n_embd
         )
 
         # Timestep embedding
@@ -243,9 +66,6 @@ class FirstLayer(nn.Module):
             nn.Linear(config.n_embd, config.n_embd),
         )
 
-        # Class embedding
-        self.y_embedder = nn.Embedding(config.num_classes, config.n_embd)
-
     def _get_sinusoidal_embeddings(self, n_position, d_hid):
         position = torch.arange(n_position).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_hid, 2) * -(math.log(10000.0) / d_hid))
@@ -254,30 +74,92 @@ class FirstLayer(nn.Module):
         pos_embedding[0, :, 1::2] = torch.cos(position * div_term)
         return pos_embedding
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> tuple:
-        """
-        Args:
-            x (torch.Tensor): Input image tensor of shape (N, C, H, W)
-            t (torch.Tensor): Timestep tensor of shape (N,)
-            y (torch.Tensor): Class labels tensor of shape (N,)
+    def forward(
+        self,
+        x: torch.Tensor,
+        obs: torch.Tensor,
+        agent_pos: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        B, T, _ = obs.shape
 
-        Returns:
-            tuple: (x, c) where x is the patched and embedded input, and c is the combined timestep and class embedding
-        """
-        # Patchify x
-        x = self.patchify(x)  # Shape: (N, block_size, n_embd)
-        x = x + self.pos_embed  # Add positional embedding
+        x = self.act_embedding(x)
+        x = x + self.x_pos_embed  # Add positional embedding
+
+        # Concatenate observation and agent positions
+        obs_features = torch.cat([obs, agent_pos], dim=-1)
+
+        # Create observation embedding
+        obs_emb = self.obs_embedding(obs_features)  # Shape: (B, T, n_embd)
+        obs_emb = obs_emb + self.obs_pos_embed
+
+        # Flatten observation embedding
+        obs_cond = obs_emb.view(B, -1)  # Shape: (B, T * n_embd)
+
+        # Project flattened observation to match timestep embedding dimension
+        obs_cond = self.obs_projection(obs_cond)  # Shape: (B, n_embd)
 
         # Embed timestep
-        t_emb = self.t_embedder(t.float().unsqueeze(-1))  # Shape: (N, n_embd)
+        t_emb = self.t_embedder(t)  # Shape: (B, n_embd)
 
-        # Embed class labels
-        y_emb = self.y_embedder(y.long())  # Shape: (N, n_embd)
-
-        # Combine timestep and class embeddings
-        c = t_emb + y_emb  # Shape: (N, n_embd)
+        # Combine observation and timestep embeddings
+        c = obs_cond + t_emb  # Shape: (B, n_embd)
 
         return x, c
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, config: DiTConfig):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_head = config.n_head
+
+        # Layer norms
+        self.norm1 = nn.LayerNorm(config.n_embd, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(config.n_embd, elementwise_affine=False, eps=1e-6)
+
+        # Self-attention
+        self.attn = nn.MultiheadAttention(
+            config.n_embd, config.n_head, batch_first=True
+        )
+
+        # MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(config.n_embd, 4 * config.n_embd),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(4 * config.n_embd, config.n_embd),
+        )
+
+        # AdaLN-Zero modulation
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(config.n_embd, 6 * config.n_embd, bias=True)
+        )
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+
+        modulation = self.adaLN_modulation(c)  # Shape: (B, 6*C)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            modulation.chunk(6, dim=1)
+        )
+
+        # Self-attention
+        x = (
+            x
+            + gate_msa.unsqueeze(1)
+            * self.attn(
+                self.norm1(x * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)),
+                self.norm1(x * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)),
+                self.norm1(x * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)),
+            )[0]
+        )
+
+        # MLP
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            self.norm2(x * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1))
+        )
+
+        return x
 
 
 class FinalLayer(nn.Module):
@@ -286,47 +168,20 @@ class FinalLayer(nn.Module):
         self.norm_final = nn.LayerNorm(
             config.n_embd, elementwise_affine=False, eps=1e-6
         )
-        self.linear = nn.Linear(
-            config.n_embd,
-            config.patch_size * config.patch_size * config.out_channels,
-            bias=True,
-        )
+        self.linear = nn.Linear(config.n_embd, config.action_dim, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(config.n_embd, 2 * config.n_embd, bias=True)
         )
 
     def forward(self, x, c):
-        B, T, C = x.shape
-        modulation = self.adaLN_modulation(c)  # Shape: (B, T, 6*C)
-        modulation = modulation[:, -1, :]  # Take the last token, shape: (B, 6*C)
-        modulation = modulation.view(B, 2, C)  # Reshape to (B, 6, C)
-
+        modulation = self.adaLN_modulation(c)  # Shape: (B, 2*C)
         shift, scale = modulation.chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
+        x = self.norm_final(x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1))
         x = self.linear(x)
         return x
 
 
-# Create a simple DiT model with 2 blocks
 class DiT(nn.Module):
-    """
-    Diffusion Transformer (DiT) model.
-
-    This class implements the main architecture of the DiT model, which combines
-    elements of transformers and diffusion models for image generation tasks.
-
-    Attributes:
-        config (DiTConfig): Configuration object containing model parameters.
-        patchify (Patchify): Module to convert input images into patches.
-        pos_embedding (nn.Parameter): Learnable positional embeddings.
-        blocks (nn.ModuleList): List of DiTBlock modules.
-        final_layer (FinalLayer): Final processing layer of the model.
-
-    Args:
-        config (DiTConfig): Configuration object for the DiT model.
-
-    """
-
     def __init__(self, config: DiTConfig, skip_init=False):
         super().__init__()
         self.config = config
@@ -352,81 +207,61 @@ class DiT(nn.Module):
             init.zeros_(block.adaLN_modulation[-1].bias)
 
     def forward(
-        self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor
+        self,
+        noisy_actions: torch.Tensor,
+        obs: torch.Tensor,
+        agent_pos: torch.Tensor,
+        t: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Forward pass of the DiT model.
+        x, c = self.first_layer(noisy_actions, obs, agent_pos, t)
 
-        Args:
-            x (torch.Tensor): Input image tensor of shape (batch_size, in_channels, image_size, image_size).
-            t (torch.Tensor): Timestep tensor of shape (batch_size,).
-            y (torch.Tensor): Class labels tensor of shape (batch_size,).
-
-        Returns:
-            torch.Tensor: Output image tensor of shape (batch_size, out_channels, image_size, image_size).
-        """
-        x, c = self.first_layer(x, t, y)
         for block in self.blocks:
             x = block(x, c)
-        x = self.final_layer(x, c)
-        # x shape: (batch_size, block_size, patch_size*patch_size*out_channels)
 
-        # Reshape output to image format
-        b, t, _ = x.shape
-        p = self.config.patch_size
-        h = w = self.config.image_size // p
-        x = x.view(b, h, w, p, p, self.config.out_channels)
-        # x shape: (batch_size, h//p, w//p, patch_size, patch_size, out_channels)
-        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-        # x shape: (batch_size, out_channels, h//p, patch_size, w//p, patch_size)
-        x = x.view(
-            b, self.config.out_channels, self.config.image_size, self.config.image_size
-        )
-        # x shape: (batch_size, out_channels, image_size, image_size)
-
-        return x
+        denoised_actions = self.final_layer(x, c)
+        return denoised_actions
 
 
+# Test the model
 if __name__ == "__main__":
-    # Set up the configuration
-    config = DiTConfig()
-
-    # Instantiate the model
+    config = DiTConfig(
+        obs_dim=2,
+        action_dim=2,
+        n_layer=8,
+        n_head=8,
+        n_embd=512,
+        obs_horizon=5,
+        pred_horizon=10,
+        agent_pos_dim=2,
+    )
     model = DiT(config, skip_init=True)
 
-    # Create sample inputs
     batch_size = 8
-    x = torch.randn(
-        batch_size, config.in_channels, config.image_size, config.image_size
+    obs = torch.randn(batch_size, config.obs_horizon, config.obs_dim).float()
+    agent_pos = torch.randn(
+        batch_size, config.obs_horizon, config.agent_pos_dim
     ).float()
-    t = torch.randint(0, 1000, (batch_size,)).float()  # Assuming 1000 timesteps
-    y = torch.randint(0, config.num_classes, (batch_size,)).float()
+    t = torch.randint(0, 1000, (batch_size,)).float()
 
-    # Forward pass
-    output = model(x, t, y)
+    noisy_actions = torch.randn(
+        batch_size, config.pred_horizon, config.action_dim
+    ).float()
+
+    output = model(noisy_actions, obs, agent_pos, t)
     print("Forward pass successful!")
-    print(f"Input shape: {x.shape}")
+    print(f"Input shape: {noisy_actions.shape}")
     print(f"Output shape: {output.shape}")
-    print(f"Number of patches (block size): {config.block_size}")
 
-    # Check output shape
-    expected_shape = (
-        batch_size,
-        config.out_channels,
-        config.image_size,
-        config.image_size,
-    )
+    expected_shape = (batch_size, config.pred_horizon, config.action_dim)
     assert (
         output.shape == expected_shape
     ), f"Output shape {output.shape} doesn't match expected shape {expected_shape}"
     print("Output shape is correct.")
 
-    # Check if output values are within a reasonable range
     assert torch.isfinite(output).all(), "Output contains NaN or infinite values"
     print("Output values are finite.")
 
-    # Check if the model is responsive to different inputs
-    output2 = model(x, t + 1, y)
+    output2 = model(noisy_actions, obs, agent_pos, t + 1)
     assert not torch.allclose(
         output, output2
     ), "Model output doesn't change with different timesteps"
