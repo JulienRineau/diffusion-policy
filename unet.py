@@ -111,12 +111,7 @@ class UNET(nn.Module):
 
         for feature in reversed(UnetConfig.features):
             self.ups.append(
-                nn.ConvTranspose2d(
-                    feature * 2,
-                    feature,
-                    kernel_size=2,
-                    stride=2,
-                )
+                nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2,)
             )
             self.ups.append(
                 ResNetBlock(feature * 2, feature, time_emb_dim, class_emb_dim)

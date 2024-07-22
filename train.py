@@ -1,6 +1,7 @@
 import pytorch_lightning as pl
 import torch
 import torchvision
+import wandb
 from diffusers import DDPMScheduler, UNet2DModel
 from matplotlib import pyplot as plt
 from pytorch_lightning.loggers import WandbLogger
@@ -8,7 +9,6 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-import wandb
 from unet import UNET, UnetConfig
 
 
