@@ -1,9 +1,10 @@
+import logging
+import os
+
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
-import logging
-import os
 
 logging.basicConfig(level=logging.INFO)
 
@@ -143,6 +144,7 @@ def test_visualization_with_custom_dataset(
 
 if __name__ == "__main__":
     import torch
+
     from dataset import CustomLeRobotDataset
 
     # Create the custom dataset
