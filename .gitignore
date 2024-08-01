@@ -169,4 +169,4 @@ cython_debug/
 *.ckpt
 
 *.png
-output_video.mp4
+*.mp4
