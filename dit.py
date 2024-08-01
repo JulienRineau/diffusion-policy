@@ -139,9 +139,14 @@ class DiTBlock(nn.Module):
         B, T, _ = x.shape
 
         modulation = self.adaLN_modulation(c)  # Shape: (B, 6*C)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            modulation.chunk(6, dim=1)
-        )
+        (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = modulation.chunk(6, dim=1)
 
         # Self-attention
         x = (
