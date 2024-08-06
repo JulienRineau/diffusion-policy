@@ -10,7 +10,7 @@ from octo_transformer import OctoConfig
 import pytorch_lightning as pl
 import torch
 import wandb
-from dataset import CustomLeRobotDataset
+from dataset import ShardedLeRobotDataset
 from diffusers import DDPMScheduler
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
@@ -138,6 +138,7 @@ class DiTLightning(pl.LightningModule):
 
 
 if __name__ == "__main__":
+    wandb.finish()
     warnings.filterwarnings("ignore", category=UserWarning, module="scipy")
 
     torch.set_float32_matmul_precision("medium")
@@ -151,9 +152,9 @@ if __name__ == "__main__":
 
     trainer_config = TrainerConfig(
         batch_size=64,
-        lr=1e-4,
-        obs_horizon=5,
-        pred_horizon=10,
+        lr=3e-4,
+        obs_horizon=2,
+        pred_horizon=16,
         image_size=96,
         patch_size=8,
         action_dim=2,
@@ -163,14 +164,15 @@ if __name__ == "__main__":
         n_ocot_embd=384,
     )
 
-    dataset = CustomLeRobotDataset(
+    dataset = ShardedLeRobotDataset(
         "lerobot/pusht",
         prediction_horizon=trainer_config.pred_horizon,
         observation_horizon=trainer_config.obs_horizon,
+        shard_size=1000,
     )
 
     # Create a 70/30 split for train and validation
-    train_size = int(0.7 * len(dataset))
+    train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
@@ -189,22 +191,22 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        max_epochs=100,
+        max_epochs=60,
         logger=wandb_logger,
         precision="bf16-mixed",
         log_every_n_steps=1,
         accelerator="auto",
         devices="auto",
         gradient_clip_val=1.0,
+        val_check_interval=0.5,
         callbacks=[checkpoint_callback],
-        accumulate_grad_batches=4,
     )
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=trainer_config.batch_size,
         shuffle=True,
-        num_workers=1,
+        num_workers=25,
         persistent_workers=True,
     )
 
@@ -212,7 +214,7 @@ if __name__ == "__main__":
         val_dataset,
         batch_size=trainer_config.batch_size,
         shuffle=False,
-        num_workers=1,
+        num_workers=25,
         persistent_workers=True,
     )
 
