@@ -46,6 +46,7 @@ class DiTLightning(pl.LightningModule):
     def __init__(self, trainer_config: TrainerConfig):
         super().__init__()
         self.save_hyperparameters()
+        self.trainer_config = trainer_config
 
         octo_config = OctoConfig(
             obs_horizon=trainer_config.obs_horizon,
@@ -76,9 +77,9 @@ class DiTLightning(pl.LightningModule):
         return self.net(x, t, class_labels)
 
     def _shared_step(self, batch, batch_idx):
-        observation_states = batch["observation_states"]
+        observation_states = batch["observation_states"] / 512
         observation_images = batch["observation_images"]
-        prediction_actions = batch["prediction_actions"]
+        prediction_actions = batch["prediction_actions"] / 512
 
         noise = torch.randn_like(prediction_actions)
 
@@ -97,7 +98,10 @@ class DiTLightning(pl.LightningModule):
             noisy_latents, observation_images, observation_states, timesteps
         )
 
-        loss = F.mse_loss(noise_pred, prediction_actions)
+        loss = F.mse_loss(noise_pred, noise)
+        if not torch.isfinite(loss):
+            print(f"Non-finite loss detected: {loss}")
+            return None
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -191,7 +195,7 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        max_epochs=60,
+        max_epochs=20,
         logger=wandb_logger,
         precision="bf16-mixed",
         log_every_n_steps=1,
