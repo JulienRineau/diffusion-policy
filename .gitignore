@@ -170,3 +170,5 @@ cython_debug/
 
 *.png
 *.mp4
+
+*.json
