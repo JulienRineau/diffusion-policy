@@ -1,10 +1,11 @@
 import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
-
+import random
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
 
 @dataclass
@@ -15,50 +16,68 @@ class OctoConfig:
     n_layer: int = 12
     n_head: int = 6
     n_embd: int = 384
-    n_img_tokens: int = 49
-    d_img: int = 128
-    d_pos: int = 64
+    image_size: int = 96
+    patch_size: int = 8
 
     @property
-    def d_combined(self):
-        return self.d_img + self.d_pos
+    def n_img_tokens(self):
+        return (self.image_size // self.patch_size) ** 2
 
 
 class ImageTokenizer(nn.Module):
     def __init__(self, config: OctoConfig):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, config.d_img, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
+        self.config = config
+        self.patch_size = config.patch_size
+        self.projection = nn.Linear(
+            self.patch_size * self.patch_size * 3, config.n_embd
         )
-        self.flatten = nn.Flatten(2)
+        self.temporal_embedding = nn.Parameter(
+            torch.randn(1, config.obs_horizon, 1, config.n_embd)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = x.shape
-        x = x.view(B * T, C, H, W)
-        x = self.conv(x)
-        x = self.flatten(x)
-        x = x.view(B, T, config.n_img_tokens, config.d_img)
+        p = self.patch_size
+
+        assert (
+            H % p == 0 and W % p == 0
+        ), f"Image dimensions must be divisible by the patch size {p}"
+
+        x = x.view(B * T, C, H // p, p, W // p, p)
+        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+        x = x.view(B * T, -1, p * p * C)
+
+        x = self.projection(x)
+        x = x.view(B, T, -1, self.config.n_embd)
+
+        # Add temporal embedding
+        x = x + self.temporal_embedding
+
         return x
 
 
-class PositionTokenizer(nn.Module):
+class AgentStateTokenizer(nn.Module):
     def __init__(self, config: OctoConfig):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(2, 32),
             nn.ReLU(),
-            nn.Linear(32, config.d_pos),
+            nn.Linear(32, config.n_embd),
+        )
+        self.temporal_embedding = nn.Parameter(
+            torch.randn(1, config.obs_horizon, 1, config.n_embd)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
         x = self.mlp(x)
-        return x.view(B, T, 1, config.d_pos)
+        x = x.view(B, T, 1, -1)
+
+        # Add temporal embedding
+        x = x + self.temporal_embedding
+
+        return x
 
 
 class MaskedSelfAttention(nn.Module):
@@ -87,18 +106,20 @@ class MaskedSelfAttention(nn.Module):
             False  # Prevent other tokens from attending to the readout token
         )
 
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(
+            k.size(-1) + 1e-8
+        )
+        attn_weights = attn_weights.masked_fill(~mask, float("-inf"))
+        attn_weights = F.softmax(attn_weights, dim=-1)
 
+        y = torch.matmul(attn_weights, v)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
+
         return y
 
 
 class Block(nn.Module):
-    """A single transformer block containing a layer normalization, a masked self-attention layer,
-    another layer normalization, and an MLP.
-    """
-
     def __init__(self, config: OctoConfig):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
@@ -113,13 +134,6 @@ class Block(nn.Module):
 
 
 class MLP(nn.Module):
-    """
-    Attributes:
-        fc (nn.Linear): The first fully connected layer.
-        gelu (nn.GELU): Gaussian Error Linear Unit activation layer.
-        proj (nn.Linear): The second fully connected layer projecting back to embedding dimension.
-    """
-
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
@@ -140,14 +154,16 @@ class OctoTransformer(nn.Module):
         self.config = config
 
         self.image_tokenizer = ImageTokenizer(config)
-        self.position_tokenizer = PositionTokenizer(config)
+        self.agent_state_tokenizer = AgentStateTokenizer(config)
 
         self.readout_token = nn.Parameter(torch.randn(1, 1, config.n_embd))
-        self.projection = nn.Linear(config.d_combined, config.n_embd)
-        self.pos_embedding = nn.Parameter(
-            torch.randn(
-                1, config.obs_horizon * (config.n_img_tokens + 1) + 1, config.n_embd
-            )
+
+        total_tokens = (
+            config.obs_horizon * (config.n_img_tokens + 1) + 1
+        )  # +1 for readout token
+
+        self.pos_embed = nn.Parameter(
+            self._get_sinusoidal_embeddings(total_tokens, config.n_embd)
         )
 
         self.transformer = nn.ModuleDict(
@@ -168,26 +184,34 @@ class OctoTransformer(nn.Module):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
 
-    def forward(self, images: torch.Tensor, agent_pos: torch.Tensor) -> torch.Tensor:
+    def _get_sinusoidal_embeddings(self, n_position, d_hid):
+        position = torch.arange(n_position).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_hid, 2) * -(math.log(10000.0) / d_hid))
+        pos_embedding = torch.zeros(1, n_position, d_hid)
+        pos_embedding[0, :, 0::2] = torch.sin(position * div_term)
+        pos_embedding[0, :, 1::2] = torch.cos(position * div_term)
+        return pos_embedding
+
+    def forward(self, images: torch.Tensor, agent_state: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = images.shape
         assert (
             T == self.config.obs_horizon
         ), f"Expected obs_horizon {self.config.obs_horizon}, got {T}"
 
-        # Tokenize inputs
+        # Tokenize inputs (temporal embeddings are added within the tokenizers)
         image_tokens = self.image_tokenizer(images)
-        pos_tokens = self.position_tokenizer(agent_pos)
+        agent_state_tokens = self.agent_state_tokenizer(agent_state)
 
-        # Combine tokens
-        combined_tokens = torch.cat([pos_tokens, image_tokens], dim=2)
-        combined_tokens = combined_tokens.view(B, -1, self.config.d_combined)
+        # Combine tokens for each timestep
+        combined_tokens = torch.cat([agent_state_tokens, image_tokens], dim=2)
 
-        # Project to embedding dimension
-        projected_tokens = self.projection(combined_tokens)
+        # Reshape to flatten the temporal and spatial dimensions
+        combined_tokens = combined_tokens.view(B, -1, self.config.n_embd)
 
-        # Add position embeddings and readout token (at the end)
-        x = torch.cat([projected_tokens, self.readout_token.expand(B, -1, -1)], dim=1)
-        x = x + self.pos_embedding
+        # Add readout token
+        x = torch.cat([combined_tokens, self.readout_token.expand(B, -1, -1)], dim=1)
+
+        x = x + self.pos_embed
 
         # Apply transformer blocks
         for block in self.transformer.h:
@@ -199,61 +223,84 @@ class OctoTransformer(nn.Module):
         return x[:, -1]
 
 
-if __name__ == "__main__":
-    # Set up logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-
-    # Test the OctoTransformer
-    logger.info("Testing OctoTransformer")
-
-    # Create a config
-    config = OctoConfig()
-
-    # Initialize the model
-    model = OctoTransformer(config)
-    logger.info(
-        f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters"
-    )
-
-    # Generate random input data
+def generate_sample_data(config: OctoConfig) -> Tuple[torch.Tensor, torch.Tensor]:
     batch_size = 4
-    images = torch.randn(batch_size, config.obs_horizon, 3, 96, 96)
-    agent_pos = torch.randn(batch_size, config.obs_horizon, 2)
+    images = torch.randn(
+        batch_size, config.obs_horizon, 3, config.image_size, config.image_size
+    )
+    agent_state = torch.randn(batch_size, config.obs_horizon, 2)
+    return images, agent_state
 
-    # Move model and inputs to the same device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    images = images.to(device)
-    agent_pos = agent_pos.to(device)
 
-    # Perform a forward pass
-    try:
-        output = model(images, agent_pos)
-        logger.info(f"Forward pass successful. Output shape: {output.shape}")
-    except Exception as e:
-        logger.error(f"Forward pass failed with error: {str(e)}")
-        raise
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    random.seed(42)
+
+    config = OctoConfig()
+    model = OctoTransformer(config)
+
+    images, agent_state = generate_sample_data(config)
+
+    output = model(images, agent_state)
+    print(f"Output shape: {output.shape}")
 
     # Check output shape
-    expected_shape = (batch_size, config.n_embd)
-    if output.shape == expected_shape:
-        logger.info(f"Output shape matches expected shape: {expected_shape}")
-    else:
-        logger.error(
-            f"Output shape {output.shape} does not match expected shape {expected_shape}"
-        )
-
-    # Check for NaNs in the output
-    if torch.isnan(output).any():
-        logger.error("Output contains NaNs")
-    else:
-        logger.info("Output does not contain NaNs")
-
-    # Additional checks (optional)
+    expected_output_shape = (images.shape[0], config.n_embd)
     assert (
-        output.shape == expected_shape
-    ), f"Output shape {output.shape} does not match expected shape {expected_shape}"
-    assert not torch.isnan(output).any(), "Output contains NaNs"
+        output.shape == expected_output_shape
+    ), f"Expected output shape {expected_output_shape}, but got {output.shape}"
 
-    logger.info("Testing complete")
+    print("Basic dimension check passed.")
+
+    # Additional checks with detailed dimension prints
+    print("\nDetailed Dimension Information:")
+
+    print(f"Input images shape: {images.shape}")
+    print(f"Input agent_state shape: {agent_state.shape}")
+
+    image_tokens = model.image_tokenizer(images)
+    print(f"Image tokens shape: {image_tokens.shape}")
+    expected_image_tokens_shape = (
+        images.shape[0],
+        config.obs_horizon,
+        config.n_img_tokens,
+        config.n_embd,
+    )
+    assert (
+        image_tokens.shape == expected_image_tokens_shape
+    ), f"Expected image tokens shape {expected_image_tokens_shape}, but got {image_tokens.shape}"
+
+    agent_state_tokens = model.agent_state_tokenizer(agent_state)
+    print(f"Agent state tokens shape: {agent_state_tokens.shape}")
+    expected_agent_state_tokens_shape = (
+        agent_state.shape[0],
+        config.obs_horizon,
+        1,
+        config.n_embd,
+    )
+    assert (
+        agent_state_tokens.shape == expected_agent_state_tokens_shape
+    ), f"Expected agent state tokens shape {expected_agent_state_tokens_shape}, but got {agent_state_tokens.shape}"
+
+    print(f"Readout token shape: {model.readout_token.shape}")
+    print(f"Positional embedding shape: {model.pos_embed.shape}")
+
+    combined_tokens = torch.cat([agent_state_tokens, image_tokens], dim=2)
+    print(f"Combined tokens shape (before reshape): {combined_tokens.shape}")
+
+    combined_tokens_reshaped = combined_tokens.view(images.shape[0], -1, config.n_embd)
+    print(f"Combined tokens shape (after reshape): {combined_tokens_reshaped.shape}")
+
+    print("Image and agent state tokenizer checks passed.")
+
+    # Check if weights are different from default initialization
+    for name, param in model.named_parameters():
+        if "weight" in name:
+            assert not torch.allclose(
+                param, torch.zeros_like(param)
+            ), f"Weights in {name} are close to zero, which suggests they might not have been properly initialized"
+
+    print("Weight initialization check passed.")
+
+    print("All tests passed successfully!")

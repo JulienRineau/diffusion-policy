@@ -5,18 +5,16 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 from torch.nn import functional as F
+from octo_transformer import OctoTransformer, OctoConfig
 
 
 @dataclass
 class DiTConfig:
-    obs_dim: int = 3  # Dimension of observation (excluding agent position)
     action_dim: int = 4  # Dimension of action
     n_layer: int = 8
     n_head: int = 8
     n_embd: int = 512  # Hidden dimension size
-    obs_horizon: int = 2  # Number of observation steps
     pred_horizon: int = 10  # Number of prediction steps
-    agent_pos_dim: int = 2  # Dimension of agent position
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -35,9 +33,10 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 
 class FirstLayer(nn.Module):
-    def __init__(self, config: DiTConfig):
+    def __init__(self, config: DiTConfig, octo_config: OctoConfig):
         super().__init__()
         self.config = config
+        self.octo_config = octo_config
 
         # Action embedding
         self.act_embedding = nn.Linear(config.action_dim, config.n_embd)
@@ -46,17 +45,11 @@ class FirstLayer(nn.Module):
             self._get_sinusoidal_embeddings(config.pred_horizon, config.n_embd)
         )
 
-        # Observation embedding
-        self.obs_embedding = nn.Linear(
-            config.obs_dim + config.agent_pos_dim, config.n_embd
-        )
-        # Observation positional embedding
-        self.obs_pos_embed = nn.Parameter(
-            self._get_sinusoidal_embeddings(config.obs_horizon, config.n_embd)
-        )
-        self.obs_projection = nn.Linear(
-            config.obs_horizon * config.n_embd, config.n_embd
-        )
+        # OctoTransformer
+        self.octo_transformer = OctoTransformer(octo_config)
+
+        # Projection for OctoTransformer output
+        self.octo_projection = nn.Linear(octo_config.n_embd, config.n_embd)
 
         # Timestep embedding
         self.t_embedder = nn.Sequential(
@@ -77,32 +70,25 @@ class FirstLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        obs: torch.Tensor,
-        agent_pos: torch.Tensor,
+        images: torch.Tensor,
+        agent_state: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        B, T, _ = obs.shape
+        B, T, _ = x.shape
 
         x = self.act_embedding(x)
         x = x + self.x_pos_embed  # Add positional embedding
 
-        # Concatenate observation and agent positions
-        obs_features = torch.cat([obs, agent_pos], dim=-1)
+        # Use OctoTransformer to process images and agent_state
+        octo_output = self.octo_transformer(images, agent_state)
 
-        # Create observation embedding
-        obs_emb = self.obs_embedding(obs_features)  # Shape: (B, T, n_embd)
-        obs_emb = obs_emb + self.obs_pos_embed
-
-        # Flatten observation embedding
-        obs_cond = obs_emb.view(B, -1)  # Shape: (B, T * n_embd)
-
-        # Project flattened observation to match timestep embedding dimension
-        obs_cond = self.obs_projection(obs_cond)  # Shape: (B, n_embd)
+        # Project OctoTransformer output to match DiT embedding dimension
+        obs_cond = self.octo_projection(octo_output)  # Shape: (B, n_embd)
 
         # Embed timestep
         t_emb = self.t_embedder(t)  # Shape: (B, n_embd)
 
-        # Combine observation and timestep embeddings
+        # Combine OctoTransformer output and timestep embeddings
         c = obs_cond + t_emb  # Shape: (B, n_embd)
 
         return x, c
@@ -187,11 +173,12 @@ class FinalLayer(nn.Module):
 
 
 class DiT(nn.Module):
-    def __init__(self, config: DiTConfig, skip_init=False):
+    def __init__(self, config: DiTConfig, octo_config: OctoConfig, skip_init=False):
         super().__init__()
         self.config = config
+        self.octo_config = octo_config
 
-        self.first_layer = FirstLayer(config)
+        self.first_layer = FirstLayer(config, octo_config)
         self.blocks = nn.ModuleList([DiTBlock(config) for _ in range(config.n_layer)])
         self.final_layer = FinalLayer(config)
 
@@ -199,65 +186,76 @@ class DiT(nn.Module):
             self.__init_weights()
 
     def __init_weights(self):
-        # Initialize final layer weights to zero
-        init.zeros_(self.final_layer.linear.weight)
+        # Initialize final layer weights to small random values
+        init.normal_(self.final_layer.linear.weight, std=0.02)
         init.zeros_(self.final_layer.linear.bias)
 
-        # Initialize adaLN weights to zero
-        init.zeros_(self.final_layer.adaLN_modulation[-1].weight)
+        # Initialize adaLN weights to small random values
+        init.normal_(self.final_layer.adaLN_modulation[-1].weight, std=0.02)
         init.zeros_(self.final_layer.adaLN_modulation[-1].bias)
 
         for block in self.blocks:
-            init.zeros_(block.adaLN_modulation[-1].weight)
+            init.normal_(block.adaLN_modulation[-1].weight, std=0.02)
             init.zeros_(block.adaLN_modulation[-1].bias)
 
     def forward(
         self,
         noisy_actions: torch.Tensor,
-        obs: torch.Tensor,
-        agent_pos: torch.Tensor,
+        images: torch.Tensor,
+        agent_state: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        x, c = self.first_layer(noisy_actions, obs, agent_pos, t)
+        x, c = self.first_layer(noisy_actions, images, agent_state, t)
 
         for block in self.blocks:
             x = block(x, c)
 
         denoised_actions = self.final_layer(x, c)
+
         return denoised_actions
 
 
-# Test the model
+# Test the integrated model
 if __name__ == "__main__":
-    config = DiTConfig(
-        obs_dim=2,
+    octo_config = OctoConfig(
+        obs_horizon=5,
+        n_embd=384,
+        image_size=96,
+        patch_size=8,
+    )
+
+    dit_config = DiTConfig(
         action_dim=2,
         n_layer=8,
         n_head=8,
         n_embd=512,
-        obs_horizon=5,
         pred_horizon=10,
-        agent_pos_dim=2,
     )
-    model = DiT(config, skip_init=True)
+
+    model = DiT(dit_config, octo_config, skip_init=False)
 
     batch_size = 8
-    obs = torch.randn(batch_size, config.obs_horizon, config.obs_dim).float()
-    agent_pos = torch.randn(
-        batch_size, config.obs_horizon, config.agent_pos_dim
+    images = torch.randn(
+        batch_size,
+        octo_config.obs_horizon,
+        3,
+        octo_config.image_size,
+        octo_config.image_size,
     ).float()
+    agent_state = torch.randn(batch_size, octo_config.obs_horizon, 2).float()
     t = torch.randint(0, 1000, (batch_size,)).float()
 
     noisy_actions = torch.randn(
-        batch_size, config.pred_horizon, config.action_dim
+        batch_size, dit_config.pred_horizon, dit_config.action_dim
     ).float()
 
-    output = model(noisy_actions, obs, agent_pos, t)
+    output = model(noisy_actions, images, agent_state, t)
+
     print("Forward pass successful!")
     print(f"Input shape: {noisy_actions.shape}")
     print(f"Output shape: {output.shape}")
 
-    expected_shape = (batch_size, config.pred_horizon, config.action_dim)
+    expected_shape = (batch_size, dit_config.pred_horizon, dit_config.action_dim)
     assert (
         output.shape == expected_shape
     ), f"Output shape {output.shape} doesn't match expected shape {expected_shape}"
@@ -266,7 +264,7 @@ if __name__ == "__main__":
     assert torch.isfinite(output).all(), "Output contains NaN or infinite values"
     print("Output values are finite.")
 
-    output2 = model(noisy_actions, obs, agent_pos, t + 1)
+    output2 = model(noisy_actions, images, agent_state, t + 1)
     assert not torch.allclose(
         output, output2
     ), "Model output doesn't change with different timesteps"
