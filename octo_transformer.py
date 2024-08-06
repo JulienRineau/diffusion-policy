@@ -13,6 +13,7 @@ class OctoConfig:
     obs_horizon: int = 2
     pred_horizon: int = 64
     act_horizon: int = 12
+    agent_state_dim: int = 2
     n_layer: int = 12
     n_head: int = 6
     n_embd: int = 384
@@ -61,7 +62,7 @@ class AgentStateTokenizer(nn.Module):
     def __init__(self, config: OctoConfig):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(2, 32),
+            nn.Linear(config.agent_state_dim, 32),
             nn.ReLU(),
             nn.Linear(32, config.n_embd),
         )

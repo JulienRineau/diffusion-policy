@@ -15,7 +15,8 @@ from diffusers import DDPMScheduler
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
+
 
 from dit import DiT, DiTConfig
 
@@ -27,12 +28,41 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 class TrainerConfig:
     batch_size: int = 32
     lr: float = 1e-4
+    obs_horizon: int = 5
+    pred_horizon: int = 10
+    image_size: int = 96
+    patch_size: int = 8
+    action_dim: int = 2
+    agent_state_dim: int = 2
+    n_dit_layer: int = 8
+    n_dit_head: int = 8
+    n_dit_embd: int = 512
+    n_octo_layer: int = 6
+    n_octo_head: int = 6
+    n_ocot_embd: int = 384
 
 
 class DiTLightning(pl.LightningModule):
-    def __init__(self, dit_config, octo_config, trainer_config: TrainerConfig):
+    def __init__(self, trainer_config: TrainerConfig):
         super().__init__()
         self.save_hyperparameters()
+
+        octo_config = OctoConfig(
+            obs_horizon=trainer_config.obs_horizon,
+            n_embd=trainer_config.n_ocot_embd,
+            image_size=trainer_config.image_size,
+            patch_size=trainer_config.patch_size,
+            n_layer=trainer_config.n_octo_layer,
+            n_head=trainer_config.n_octo_head,
+        )
+
+        dit_config = DiTConfig(
+            action_dim=trainer_config.action_dim,
+            n_layer=trainer_config.n_dit_layer,
+            n_head=trainer_config.n_dit_head,
+            n_embd=trainer_config.n_dit_embd,
+            pred_horizon=trainer_config.pred_horizon,
+        )
         self.net = DiT(dit_config, octo_config)
         self.num_train_timesteps = 1000
         self.noise_scheduler = DDPMScheduler(
@@ -45,32 +75,33 @@ class DiTLightning(pl.LightningModule):
     def forward(self, x, t, class_labels):
         return self.net(x, t, class_labels)
 
-    def training_step(self, batch, batch_idx):
-        (
-            observation_states,
-            observation_actions,
-            observation_images,
-            prediction_actions,
-        ) = batch
+    def _shared_step(self, batch, batch_idx):
+        observation_states = batch["observation_states"]
+        observation_images = batch["observation_images"]
+        prediction_actions = batch["prediction_actions"]
 
-        noise = torch.randn_like(observation_actions)
+        noise = torch.randn_like(prediction_actions)
 
         timesteps = torch.randint(
             0,
             self.num_train_timesteps,
-            (observation_actions.shape[0],),
+            (prediction_actions.shape[0],),
             device=self.device,
         ).long()
 
         noisy_latents = self.noise_scheduler.add_noise(
-            observation_actions, noise, timesteps
-        )  # TODO: verify is does not modify observation_actions inplace
+            prediction_actions, noise, timesteps
+        )
 
         noise_pred = self.net(
-            noisy_latents, observation_images, timesteps, observation_states, timesteps
+            noisy_latents, observation_images, observation_states, timesteps
         )
 
         loss = F.mse_loss(noise_pred, prediction_actions)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        loss = self._shared_step(batch, batch_idx)
         if not torch.isfinite(loss):
             print(f"Non-finite loss detected: {loss}")
             return None
@@ -88,6 +119,20 @@ class DiTLightning(pl.LightningModule):
 
         return loss
 
+    def validation_step(self, batch, batch_idx):
+        loss = self._shared_step(batch, batch_idx)
+        self.log(
+            "val_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+            batch_size=self.batch_size,
+        )
+        return loss
+
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-2)
 
@@ -101,34 +146,41 @@ if __name__ == "__main__":
     wandb.init(project="diffusion_policy", save_code=True, mode="online")
     wandb_logger = WandbLogger(log_model=True)
 
-    dataset = CustomLeRobotDataset(
-        "lerobot/pusht", prediction_horizon=16, observation_horizon=2
-    )
+    prediction_horizon = 16
+    observation_horizon = 2
 
-    trainer_config = TrainerConfig(batch_size=64, lr=1e-4)
-
-    octo_config = OctoConfig(
+    trainer_config = TrainerConfig(
+        batch_size=64,
+        lr=1e-4,
         obs_horizon=5,
-        n_embd=384,
+        pred_horizon=10,
         image_size=96,
         patch_size=8,
-    )
-
-    dit_config = DiTConfig(
         action_dim=2,
-        n_layer=8,
-        n_head=8,
-        n_embd=512,
-        pred_horizon=10,
+        n_dit_layer=8,
+        n_dit_head=8,
+        n_dit_embd=512,
+        n_ocot_embd=384,
     )
 
-    model = DiTLightning(dit_config, octo_config, trainer_config)
+    dataset = CustomLeRobotDataset(
+        "lerobot/pusht",
+        prediction_horizon=trainer_config.pred_horizon,
+        observation_horizon=trainer_config.obs_horizon,
+    )
+
+    # Create a 70/30 split for train and validation
+    train_size = int(0.7 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    model = DiTLightning(trainer_config)
 
     checkpoint_dir = "checkpoints_dp"
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename="dp-{epoch:02d}-{step}-{train_loss:.2f}",
-        monitor="train_loss",
+        filename="dp-{epoch:02d}-{step}-{train_loss:.2f}-{val_loss:.2f}",
+        monitor="val_loss",
         mode="min",
         save_top_k=10,
         save_on_train_epoch_end=True,
@@ -137,7 +189,7 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        max_epochs=400,
+        max_epochs=100,
         logger=wandb_logger,
         precision="bf16-mixed",
         log_every_n_steps=1,
@@ -149,9 +201,17 @@ if __name__ == "__main__":
     )
 
     train_dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=trainer_config.batch_size,
         shuffle=True,
+        num_workers=1,
+        persistent_workers=True,
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=trainer_config.batch_size,
+        shuffle=False,
         num_workers=1,
         persistent_workers=True,
     )
@@ -169,9 +229,11 @@ if __name__ == "__main__":
 
     if latest_checkpoint and os.path.isfile(latest_checkpoint):
         print(f"Resuming training from checkpoint: {latest_checkpoint}")
-        trainer.fit(model, train_dataloader, ckpt_path=latest_checkpoint)
+        trainer.fit(
+            model, train_dataloader, val_dataloader, ckpt_path=latest_checkpoint
+        )
     else:
         print("Starting training from scratch")
-        trainer.fit(model, train_dataloader)
+        trainer.fit(model, train_dataloader, val_dataloader)
 
     wandb.finish()
