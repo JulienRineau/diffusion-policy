@@ -162,10 +162,12 @@ if __name__ == "__main__":
         image_size=96,
         patch_size=8,
         action_dim=2,
-        n_dit_layer=8,
-        n_dit_head=8,
-        n_dit_embd=512,
-        n_ocot_embd=384,
+        n_dit_layer=12,
+        n_dit_head=12,
+        n_dit_embd=768,
+        n_octo_layer=8,
+        n_octo_head=8,
+        n_ocot_embd=512,
     )
 
     dataset = ShardedLeRobotDataset(
@@ -176,26 +178,26 @@ if __name__ == "__main__":
     )
 
     # Create a 70/30 split for train and validation
-    train_size = int(0.8 * len(dataset))
+    train_size = int(0.7 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
     model = DiTLightning(trainer_config)
 
-    checkpoint_dir = "checkpoints_dp"
+    checkpoint_dir = "checkpoints_dp_med"
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename="dp-{epoch:02d}-{step}-{train_loss:.2f}-{val_loss:.2f}",
         monitor="val_loss",
         mode="min",
-        save_top_k=10,
+        save_top_k=5,
         save_on_train_epoch_end=True,
         save_last=True,
         every_n_epochs=1,
     )
 
     trainer = pl.Trainer(
-        max_epochs=20,
+        max_epochs=10,
         logger=wandb_logger,
         precision="bf16-mixed",
         log_every_n_steps=1,
